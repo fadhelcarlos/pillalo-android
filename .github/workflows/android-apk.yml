@@ -1,0 +1,113 @@
+# Copy of .github/workflows/android-apk.yml of the private repository, run on this PUBLIC repository's free runners
+# while the account's billing blocks the private one (2026-09-23). The source is checked out from the private repository
+# with SRC_TOKEN; secrets mirror the private repository's. Keep both in step: edit the private one, re-port with
+# _archive/qa/port-public-workflows.py (or by hand).
+name: Android APK (native shell) · public runner
+
+# Builds the Expo shell in native/ as a release APK signed with the SAME keystore EAS uses
+# (secrets PILLALO_KEYSTORE_B64 / _PASSWORD / _ALIAS / _KEY_PASSWORD), so it installs over EAS builds.
+# Manual trigger only. The APK is published as a workflow artifact and, when `release` is set, as a GitHub release asset.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release tag to publish the APK to (empty = artifact only)"
+        required: false
+        default: ""
+      debug:
+        description: "1 = expose the WebView to chrome://inspect (testing builds only, never for the public download)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      EXPO_PUBLIC_SUPABASE_URL: https://ppfnfdcwiyjarvwlszta.supabase.co
+      EXPO_PUBLIC_SUPABASE_ANON_KEY: sb_publishable_hyQC6Z8BY1_O5mghb7GV9A_yGmMcetC
+      EXPO_PUBLIC_WEBVIEW_DEBUG: ${{ github.event.inputs.debug == '1' && '1' || '0' }}
+      EXPO_NO_TELEMETRY: "1"
+    steps:
+      # the source lives in the private repository: this public repository only lends its (free) runners
+      - uses: actions/checkout@v4
+        with:
+          repository: fadhelcarlos/pillalo
+          ref: main
+          token: ${{ secrets.SRC_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            native/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install web + native dependencies
+        run: |
+          npm ci
+          cd native && npm ci
+
+      - name: Build the web layer for the shell
+        # .env is not in the repo: the web layer needs its public Supabase values at build time
+        env:
+          VITE_SUPABASE_URL: https://ppfnfdcwiyjarvwlszta.supabase.co
+          VITE_SUPABASE_ANON_KEY: sb_publishable_hyQC6Z8BY1_O5mghb7GV9A_yGmMcetC
+          VITE_APP_ORIGIN: https://pillalo.live
+        run: |
+          cd native && npm run build:web
+          grep -q "ppfnfdcwiyjarvwlszta" webapp/assets/app-*.js || { echo "web bundle is missing the Supabase URL"; exit 1; }
+
+      - name: Restore the EAS keystore (never printed)
+        run: |
+          mkdir -p native/credentials/android
+          echo "${{ secrets.PILLALO_KEYSTORE_B64 }}" | base64 -d > native/credentials/android/keystore.jks
+          node -e '
+            const fs = require("fs");
+            fs.writeFileSync("native/credentials.json", JSON.stringify({ android: { keystore: {
+              keystorePath: "credentials/android/keystore.jks",
+              keystorePassword: process.env.KS_PW, keyAlias: process.env.KS_ALIAS, keyPassword: process.env.KEY_PW } } }, null, 2));'
+        env:
+          KS_PW: ${{ secrets.PILLALO_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.PILLALO_KEYSTORE_ALIAS }}
+          KEY_PW: ${{ secrets.PILLALO_KEY_PASSWORD }}
+
+      - name: Prebuild Android project
+        run: cd native && npx expo prebuild --platform android --no-install
+
+      - name: Assemble release APK
+        run: cd native/android && ./gradlew assembleRelease --no-daemon
+
+      - name: Name the APK
+        id: apk
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          OUT="pillalo-android-${SHA}.apk"
+          cp native/android/app/build/outputs/apk/release/app-release.apk "$OUT"
+          echo "file=$OUT" >> "$GITHUB_OUTPUT"
+          keytool -printcert -jarfile "$OUT" | grep -E "SHA256|Owner" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.file }}
+          path: ${{ steps.apk.outputs.file }}
+          retention-days: 30
+
+      - name: Publish as a release asset
+        if: ${{ github.event.inputs.release != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.SRC_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.release }}"
+          gh release view -R fadhelcarlos/pillalo "$TAG" >/dev/null 2>&1 || gh release create -R fadhelcarlos/pillalo "$TAG" --title "Píllalo Android $TAG" --notes "APK firmado con el keystore de EAS (se instala encima de los builds de EAS)."
+          gh release upload -R fadhelcarlos/pillalo "$TAG" "${{ steps.apk.outputs.file }}" --clobber
